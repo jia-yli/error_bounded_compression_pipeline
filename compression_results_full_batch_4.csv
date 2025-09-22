@@ -1,0 +1,2 @@
+variable,year,month,ebcc_pointwise_max_error_ratio,data_size_bytes,compression_time,decompression_time,compression_ratio,compression_bandwidth,decompression_bandwidth,num_residual_runs
+10m_u_component_of_wind,2024,12,1,3089802240,1068.0773780345917,460.9629521369934,17.842000154559724,2.8928636665684824,6.702929651235275,2
