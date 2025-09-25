@@ -1,1 +1,2 @@
 from .compressor import ErrorBoundedCompressionPipeline
+from .zarr_codec import ErrorBounded2DCodec
