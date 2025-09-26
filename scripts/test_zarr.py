@@ -1,9 +1,10 @@
 import os
+import time
 import numpy as np
 import zarr
 import xarray as xr
 from error_bounded_compression_pipeline.compression import ErrorBounded2DCodec
-from error_bounded_compression_pipeline.compression import ErrorBoundedCompressionPipeline
+from error_bounded_compression_pipeline.compression import ErrorBoundedCompressionPipelineFullGPU
 
 # configs
 variable = "10m_u_component_of_wind"
@@ -36,22 +37,39 @@ error_bound = error_bound[0:16]
 
 
 def run_compression(method):
-  if method == 'raw':
+  if method == 'full_gpu':
     output_file = os.path.join(output_path, f'{year}_{month}_{variable}.compressed')
 
-    compression_pipeline = ErrorBoundedCompressionPipeline(
+    compression_pipeline = ErrorBoundedCompressionPipelineFullGPU(
       checkpoint_path1, 
       checkpoint_path2,
       device=f'cuda:0'
     )
 
+    compression_start_time = time.time()
     compressed_bitstream, info = compression_pipeline.compress(
       data, 
       error_bound, 
       batch_size = 16,
+      output_file=output_file,
     )
+    compression_end_time = time.time()
+    compression_time = compression_end_time - compression_start_time
 
+    decompression_start_time = time.time()
     data_hat = compression_pipeline.decompress(file_path=output_file)
+    decompression_end_time = time.time()
+    decompression_time = decompression_end_time - decompression_start_time
+
+    data_size_bytes = data.nbytes
+    compressed_size_bytes = len(compressed_bitstream)
+    compression_ratio = data_size_bytes/compressed_size_bytes
+    compression_bandwidth = data_size_bytes/1e6/compression_time
+    decompression_bandwidth = data_size_bytes/1e6/decompression_time
+    print(f"{data_size_bytes=}, {compressed_size_bytes=}, {compression_ratio=}")
+    print(f"{compression_bandwidth=}, {decompression_bandwidth=}")
+    print((np.abs(data_hat-data) <= error_bound).all())
+    import pdb;pdb.set_trace()
   elif method == 'zarr':
     output_file = os.path.join(output_path, f'{year}_{month}_{variable}.zarr')
 
@@ -89,6 +107,11 @@ def run_compression(method):
     #   order="C",
     # )
     # z[...] = data
+    data_size_bytes = data.nbytes
+    compressed_size_bytes = os.path.getsize(output_file+"/0.0.0")
+    compression_ratio = data_size_bytes/compressed_size_bytes
+    print(f"{data_size_bytes=}, {compressed_size_bytes=}, {compression_ratio=}")
+    # for 64: data_size_bytes=265789440, compressed_size_bytes=16600632, compression_ratio=16.01080248029111
 
     data_hat = np.array(zarr.open(output_file, mode="r"))
     import pdb;pdb.set_trace()
@@ -98,4 +121,5 @@ def run_compression(method):
 
 
 if __name__ == "__main__":
-  run_compression(method='zarr')
+  # run_compression(method='zarr')
+  run_compression(method='full_gpu')

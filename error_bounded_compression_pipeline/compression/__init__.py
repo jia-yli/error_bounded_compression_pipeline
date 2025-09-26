@@ -1,2 +1,2 @@
-from .compressor import ErrorBoundedCompressionPipeline
+from .compressor import ErrorBoundedCompressionPipeline, ErrorBoundedCompressionPipelineFullGPU
 from .zarr_codec import ErrorBounded2DCodec
