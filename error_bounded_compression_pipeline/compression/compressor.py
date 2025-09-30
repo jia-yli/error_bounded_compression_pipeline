@@ -106,7 +106,7 @@ class ErrorBoundedCompressionPipeline:
     results = []
     start_idx = 0
     while start_idx < num_slices:
-      print(f"[INFO] Compressing {start_idx}/{num_slices}")
+      # print(f"[INFO] Compressing {start_idx}/{num_slices}")
       end_idx = min(start_idx + batch_size, num_slices)
       # shape [B, 1, H, W] -> replicate to 3 channels
       x_tensor = torch.from_numpy(x01[start_idx:end_idx]).unsqueeze(1).repeat(1, 3, 1, 1)
@@ -491,7 +491,7 @@ class ErrorBoundedCompressionPipelineFullGPU(ErrorBoundedCompressionPipeline):
     start_idx = 0
     results = []
     while start_idx < num_slices:
-      print(f"[INFO] Compressing {start_idx}/{num_slices}")
+      # print(f"[INFO] Compressing {start_idx}/{num_slices}")
       end_idx = min(start_idx + batch_size, num_slices)
       with torch.no_grad():
         x_tensor = torch.from_numpy(x[start_idx:end_idx]).to(self.device)

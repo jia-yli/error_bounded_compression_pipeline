@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 import multiprocessing as mp
 
-from error_bounded_compression_pipeline.compression import ErrorBoundedCompressionPipeline
+from error_bounded_compression_pipeline.compression import ErrorBoundedCompressionPipeline, ErrorBoundedCompressionPipelineFullGPU
 
 import warnings
 # warnings.filterwarnings("ignore")
@@ -22,11 +22,13 @@ def run_compression_pipeline(
   warnings.filterwarnings("ignore")
   os.environ['CUBLAS_WORKSPACE_CONFIG'] = ":4096:8"
   torch.use_deterministic_algorithms(True)
-  current_proc_name = mp.current_process().name
+  current_proc_name = mp.current_process().name # "SpawnPoolWorker-{idx}"
+  num_gpus = torch.cuda.device_count()
   try:
-    worker_idx = int(current_proc_name.split('-')[-1]) % configs.num_gpus
+    worker_idx = int(current_proc_name.split('-')[-1]) % num_gpus
   except:
     worker_idx = 0
+  print(f'Worker {current_proc_name} using GPU {worker_idx}')
   # Args
   if not checkpoint_path2:
     checkpoint_path2 = checkpoint_path1
@@ -45,8 +47,9 @@ def run_compression_pipeline(
   error_bound = interpolated_ensemble_spread * ebcc_pointwise_max_error_ratio
 
   # Run
-  data = data[0:16]
-  error_bound = error_bound[0:16]
+  steps = 24*7
+  data = data[0:steps]
+  error_bound = error_bound[0:steps]
   if np.isnan(data).any():
     return {
       'variable': variable,
@@ -59,7 +62,7 @@ def run_compression_pipeline(
       # 'decompression_bandwidth': np.nan,
     }
 
-  compression_pipeline = ErrorBoundedCompressionPipeline(
+  compression_pipeline = ErrorBoundedCompressionPipelineFullGPU(
     checkpoint_path1, 
     checkpoint_path2,
     device=f'cuda:{worker_idx}')
@@ -96,6 +99,7 @@ def run_compression_pipeline(
     'month': month,
     'ebcc_pointwise_max_error_ratio' : ebcc_pointwise_max_error_ratio, 
     'data_size_bytes' : data_size_bytes,
+    'compressed_size_bytes' : compressed_size_bytes,
     'compression_time' : compression_time,
     'decompression_time' : decompression_time,
     'compression_ratio' : compression_ratio,
@@ -108,23 +112,23 @@ def run_compression_pipeline(
 
 if __name__ == '__main__':
   variable_lst = [
-    # "100m_u_component_of_wind",
-    # "100m_v_component_of_wind",
+    "100m_u_component_of_wind",
+    "100m_v_component_of_wind",
     "10m_u_component_of_wind",
     "10m_v_component_of_wind",
-    # "2m_dewpoint_temperature",
-    # "2m_temperature",
-    # "ice_temperature_layer_1",
-    # "ice_temperature_layer_2",
-    # "ice_temperature_layer_3",
-    # "ice_temperature_layer_4",
-    # "maximum_2m_temperature_since_previous_post_processing",
-    # "mean_sea_level_pressure",
-    # "minimum_2m_temperature_since_previous_post_processing",
-    # "sea_surface_temperature",
-    # "skin_temperature",
-    # "surface_pressure",
-    # "total_precipitation",
+    "2m_dewpoint_temperature",
+    "2m_temperature",
+    "ice_temperature_layer_1",
+    "ice_temperature_layer_2",
+    "ice_temperature_layer_3",
+    "ice_temperature_layer_4",
+    "maximum_2m_temperature_since_previous_post_processing",
+    "mean_sea_level_pressure",
+    "minimum_2m_temperature_since_previous_post_processing",
+    "sea_surface_temperature",
+    "skin_temperature",
+    "surface_pressure",
+    "total_precipitation",
   ]
   year_lst = [2024]
   month_lst = [12]
@@ -144,15 +148,6 @@ if __name__ == '__main__':
     [era5_path], [output_path], pointwise_max_error_ratio_lst,
     [checkpoint_path1], [checkpoint_path2],
   ))
-
-  # loop
-  results = []
-  for params in param_combinations:
-    results.append(run_compression_pipeline(*params))
-  
-    # Convert results to a structured DataFrame
-    results_df = pd.DataFrame(results)
-    results_df.to_csv(f'./error_bounded_compression_pipeline/compression_results.csv', index=False)
 
   num_gpus = torch.cuda.device_count()
   # num_gpus = 1
