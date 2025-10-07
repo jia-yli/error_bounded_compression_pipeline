@@ -4,6 +4,7 @@ import torch
 import time
 import itertools
 import pickle
+import zlib
 
 import xarray as xr
 import numpy as np
@@ -146,51 +147,82 @@ class ErrorBoundedCompressionPipeline:
     return data_hat
 
   @staticmethod
-  def slice_dominant(vals):
-    v = vals[~np.isnan(vals)]
-    if v.size == 0:
-      return np.nan, 0, 0
-    u, counts = np.unique(v, return_counts=True)
-    idx = np.argmax(counts)
-    return u[idx], counts[idx], v.size
+  def compress_fail_value(x, x_hat, error_bound, exclude_mask):
+    error = np.abs(x - x_hat)
+    fail_mask = error > error_bound
+    fail_mask[exclude_mask] = False
+    fail_idx = np.flatnonzero(fail_mask).astype(np.int32)
+    fail_val = x.flat[fail_idx]
+
+    # compress them
+    packed_fail_mask = np.packbits(fail_mask.ravel())
+    compressed_fail_mask = zlib.compress(packed_fail_mask.tobytes(), level=6)
+    compressed_fail_idx = zlib.compress(fail_idx.tobytes(), level=6)
+    compressed_fail_val = zlib.compress(fail_val.tobytes(), level=6)
+
+    if len(compressed_fail_mask) <= len(compressed_fail_idx):
+      # use mask
+      compressed_fail_idx = None
+      compressed_fail_info_size = len(compressed_fail_mask) + len(compressed_fail_val)
+      compressed_fail_info = {
+        "fail_mask": compressed_fail_mask,
+        "fail_val": compressed_fail_val,
+      }
+    else:
+      compressed_fail_mask = None
+      compressed_fail_info_size = len(compressed_fail_idx) + len(compressed_fail_val)
+      compressed_fail_info = {
+        "fail_idx": compressed_fail_idx,
+        "fail_val": compressed_fail_val,
+      }
+
+    return compressed_fail_info_size, fail_mask, fail_val, compressed_fail_info
 
   @staticmethod
-  def find_dominant(x, threshold=0.3):
-    N, H, W = x.shape
-    x_flat = x.reshape(N, -1)
+  def decompress_fail_value(shape, compressed_fail_info):
+    compressed_fail_mask = compressed_fail_info.get("fail_mask", None)
+    compressed_fail_idx = compressed_fail_info.get("fail_idx", None)
+    compressed_fail_val = compressed_fail_info["fail_val"]
 
-    dom_counts = np.zeros(N, dtype=np.int32)
+    fail_val = np.frombuffer(zlib.decompress(compressed_fail_val), dtype=np.float32)
+    if compressed_fail_mask:
+      packed_fail_mask = np.frombuffer(zlib.decompress(compressed_fail_mask), dtype=np.uint8)
+      fail_mask = np.unpackbits(packed_fail_mask)[:np.prod(shape)].reshape(shape).astype(bool)
+      # fail_idx = np.flatnonzero(fail_mask).astype(np.int32)
+    else:
+      fail_idx = np.frombuffer(zlib.decompress(compressed_fail_idx), dtype=np.int32)
+      fail_mask = np.zeros(shape, dtype=bool)
+      fail_mask.flat[fail_idx] = True
 
-    results = [ErrorBoundedCompressionPipeline.slice_dominant(x_flat[i]) for i in range(N)]
-
-    dom_vals = np.array([r[0] for r in results], dtype=x.dtype)
-    dom_counts = np.array([r[1] for r in results], dtype=np.int32)
-    valid_counts = np.array([r[2] for r in results], dtype=np.int32)
-
-    # Threshold check
-    has_dom = dom_counts > threshold * valid_counts
-
-    # Build masks (vectorized where possible)
-    dom_mask = (x == dom_vals[:, np.newaxis, np.newaxis]) & ~np.isnan(x)
-    dom_mask[~has_dom] = False
-
-    dom_vals = dom_vals[has_dom]
-    reduced_masks = dom_mask[has_dom]
-
-    return has_dom, dom_mask, dom_vals, reduced_masks
-
+    return fail_mask, fail_val
+  
   @staticmethod
-  def recover_from_reduced_masks(has_dom, dom_vals, reduced_masks, shape):
-    N, H, W = shape
-    recovered_mask = np.zeros(shape, dtype=bool)
-    dom_filled = np.full(shape, np.nan)
+  def process_nan(x, run_compression, fill_by):
+    nan_mask = np.isnan(x)
 
-    idxs = np.where(has_dom)[0]
-    if idxs.size > 0:
-        recovered_mask[idxs] = reduced_masks
-        dom_filled[idxs] = reduced_masks * dominant_vals[idxs, None, None]
-
-    return recovered_mask, dom_filled
+    # compression
+    compressed_nan_info = {}
+    if run_compression:
+      has_nan = bool(nan_mask.any())
+      compressed_nan_info['has_nan'] = has_nan
+      if has_nan:
+        packed_nan_mask = np.packbits(nan_mask.ravel())
+        compressed_nan_mask = zlib.compress(packed_nan_mask.tobytes(), level=6)
+        compressed_nan_info['compressed_nan_mask'] = compressed_nan_mask
+    
+    # process
+    if np.all(nan_mask):
+      if fill_by == 'min':
+        fill_val = 0.0
+      elif fill_by == 'max':
+        fill_val = 1.0
+      else:
+        raise ValueError(f"Unsupported fill_by {fill_by} when all values are NaN")
+    else:
+      fill_val = eval(f"x[~nan_mask].{fill_by}()")
+    x = x.copy()
+    x[nan_mask] = fill_val
+    return x, nan_mask, compressed_nan_info
 
   def compress(
     self, 
@@ -204,125 +236,110 @@ class ErrorBoundedCompressionPipeline:
       raise TypeError("arr must be a NumPy ndarray")
     if data.dtype != np.float32:
       data = data.astype(np.float32, copy=False)
-    if data.ndim < 3:
-      raise ValueError("arr must have at least 3 dims; last two are [H, W]")
+    if data.ndim != 3:
+      raise ValueError("arr must have exactly 3 dims; last two are [N, H, W]")
     
     # To [N, H, W]
-    H, W = data.shape[-2:]
-    x = data.reshape(-1, H, W)
+    N, H, W = data.shape
 
-    # '''
-    # Step 1. detect const / fill value
-    # '''
-    # nan_mask = np.isnan(x)
-    # has_nan = bool(nan_mask.any())
-    # if has_nan:
-    #   packed_mask = np.packbits(nan_mask.ravel())
-    #   # bits = np.unpackbits(packed_mask)
-    #   # bits = bits[:num_bits]  # trim padding at the end
-    
-    # '''
-    # Step 2. Find Dominant Value
-    # '''
-    # u, counts = np.unique(x[~np.isnan(x)], return_counts=True)
-    # dominant_val = u[np.argmax(counts)]
-    # dominant_mask = (x == dominant_val)
-    # has_dominant = np.sum(dominant_mask) > 0.3*x.size
-    # if has_dominant:
-    #   packed_dominant_mask = np.packbits(dominant_mask.ravel())
+    '''
+    Step 1: handle NaN
+    '''
+    x, nan_mask_data, compressed_nan_info = self.process_nan(data, run_compression=True, fill_by='min')
+    has_nan = compressed_nan_info['has_nan']
+    if has_nan:
+      compressed_nan_mask = compressed_nan_info['compressed_nan_mask']
 
+    error_bound, nan_mask_error_bound, _ = self.process_nan(error_bound, run_compression=False, fill_by='max')
 
-    x_hat = np.zeros_like(x, dtype=x.dtype)
+    # exclude mask = points donot care
+    exclude_mask = nan_mask_data | nan_mask_error_bound
+
+    '''
+    Step 2: compression
+    '''
+    # residual compression
+    net_id = 1
+    compressed_x = self._compress(
+      x,
+      error_bound=error_bound,
+      net_id=net_id,
+      batch_size=batch_size,
+    )
+    x_hat = self._decompress(compressed_x)
+    assert x_hat.dtype == np.float32
+    compressed_fail_info_size, fail_mask, fail_val, compressed_fail_info = self.compress_fail_value(x, x_hat, error_bound, exclude_mask)
+
+    '''
+    Step 3: residual compression
+    '''
+    x_hat = x_hat
     num_residual_runs = 0
-    compressed_results = []
-    num_fail_points = x.size
-    fail_info = {}
-    # _debug_x_hat_lst = []
+    compressed_residual_lst = []
+    current_compressed_fail_info_size = compressed_fail_info_size
+    current_compressed_fail_info = compressed_fail_info
     while True:
+      num_residual_runs += 1 # num runs after current loop (first run not counted as residual run)
+      # max residual runs
+      if max_residual_runs >= 0:
+        if num_residual_runs > max_residual_runs:
+          num_residual_runs -= 1 # not count current run
+          break
+
       residual = x - x_hat
 
       # residual compression
-      net_id = 1 if num_residual_runs == 0 else 2
-      compressed_residual_nested = self._compress(
+      net_id = 2
+      compressed_residual = self._compress(
         residual,
         error_bound=error_bound,
         net_id=net_id,
         batch_size=batch_size,
       )
-
-      residual_hat = self._decompress(compressed_residual_nested)
+      residual_hat = self._decompress(compressed_residual)
       assert residual_hat.dtype == np.float32
       x_hat = x_hat + residual_hat
-      # _debug_x_hat_lst.append(x_hat)
-      # check
-      # compressed_residual_nested_1 = self._compress(residual,error_bound=error_bound,net_id=net_id,batch_size=1)
-      # compressed_residual_nested_4 = self._compress(residual,error_bound=error_bound,net_id=net_id,batch_size=4)
-      # residual_hat_1 = self._decompress(compressed_residual_nested_1)
-      # residual_hat_4 = self._decompress(compressed_residual_nested_4)
-      # # not same
-      # import pdb;pdb.set_trace()
 
-      # error
-      error = np.abs(x - x_hat)
-      fail_idx = np.flatnonzero(error > error_bound).astype(np.int32)
-      fail_val = x.flat[fail_idx]
+      # fail value
+      compressed_fail_info_size, fail_mask, fail_val, compressed_fail_info = self.compress_fail_value(x, x_hat, error_bound, exclude_mask)
+
+      compressed_residual_bitstream = pickle.dumps(compressed_residual)
 
       # stop condition
-      if num_residual_runs > 0: # at least run once
-        prev_fail_bytes = num_fail_points * 4 * 2
-        current_fail_bytes = fail_idx.size * 4 * 2
-        compressed_residual_bitstream = pickle.dumps(compressed_residual_nested)
-        if len(compressed_residual_bitstream) + current_fail_bytes >= prev_fail_bytes:
-          num_residual_runs -= 1
+      if num_residual_runs > 1: # at least run once
+        if len(compressed_residual_bitstream) + compressed_fail_info_size >= current_compressed_fail_info_size:
+          # stop as no further reduction
+          num_residual_runs -= 1 # not count current run
           break
 
       # prep next run
-      compressed_results.append(compressed_residual_nested)
-      num_fail_points = fail_idx.size
-      fail_info = {
-        'fail_idx': fail_idx,
-        'fail_val': fail_val,
-      }
-
-      if max_residual_runs >= 0:
-        if num_residual_runs >= max_residual_runs:
-          # num_residual_runs: num runs after current loop (first run not counted as residual run)
-          break
-
-      num_residual_runs += 1
+      compressed_residual_lst.append(compressed_residual)
+      current_compressed_fail_info_size = compressed_fail_info_size
+      current_compressed_fail_info = compressed_fail_info
 
     # output
-    fail_info = {k: v.tobytes() for k, v in fail_info.items()}
     header = {
-      "test_header": "test_header",
       "shape": list(data.shape),
-      **fail_info,
+      "has_nan": has_nan,
+      **({"nan_mask": compressed_nan_mask} if has_nan else {}),
+      **current_compressed_fail_info,
     }
 
-    nested = [header] + compressed_results
+    compressed_obj = [header, compressed_x] + compressed_residual_lst
     if output_file:
       # save to file
       os.makedirs(os.path.dirname(output_file), exist_ok=True)
       with open(output_file, "wb") as f:   # 'wb' = write binary
-        pickle.dump(nested, f)
+        pickle.dump(compressed_obj, f)
       # compressed_file_size_bytes = len(compressed_bitstream)
       # compressed_file_size_bytes = os.path.getsize(output_file)
 
-    compressed_bitstream = pickle.dumps(nested)
+    compressed_bitstream = pickle.dumps(compressed_obj)
 
-    # check
-    # x_hat_c = _debug_x_hat_lst[-2].copy()
-    # fail_idx = np.frombuffer(header["fail_idx"], dtype=np.int32)
-    # fail_val = np.frombuffer(header["fail_val"], dtype=np.float32)
-    # x_hat_c.flat[fail_idx] = fail_val
-    # x_hat_d = self.decompress(bit_stream = compressed_bitstream)
-    # print((x_hat_c == x_hat_d).all())
-    # print((np.abs(data - x_hat_d) <= error_bound).all())
-    # import pdb;pdb.set_trace()
-    info = {
+    logger_info = {
       'num_residual_runs' : num_residual_runs,
     }
-    return compressed_bitstream, info
+    return compressed_bitstream, logger_info
 
   def decompress(
     self,
@@ -331,24 +348,36 @@ class ErrorBoundedCompressionPipeline:
   ):
     if file_path:
       with open(file_path, "rb") as f:   # 'wb' = write binary
-        nested = pickle.load(f)
+        compressed_obj = pickle.load(f)
     else:
       assert bit_stream is not None
-      nested = pickle.loads(bit_stream)
-    header = nested[0]
-    compressed_results = nested[1:]
+      compressed_obj = pickle.loads(bit_stream)
+    header = compressed_obj[0]
+    compressed_x = compressed_obj[1]
+    compressed_residual_lst = compressed_obj[2:]
 
+    '''
+    Step 1: Decode Header
+    '''
     shape = header["shape"]
-    data_hat = np.zeros(shape, dtype=np.float32)
-    for compressed_residual_nested in compressed_results:
-      residual_hat = self._decompress(compressed_residual_nested)
-      data_hat += residual_hat.reshape(shape)
+    N, H, W = shape
+    has_nan = header["has_nan"]
+    if has_nan:
+      packed_nan_mask = np.frombuffer(zlib.decompress(header["nan_mask"]), dtype=np.uint8)
+      nan_mask = np.unpackbits(packed_nan_mask)[:N*H*W].reshape((N, H, W)).astype(bool)
+    fail_mask, fail_val = self.decompress_fail_value([N, H, W], header)
+
+    x_hat = self._decompress(compressed_x).reshape(shape)
+
+    for compressed_residual in compressed_residual_lst:
+      residual_hat = self._decompress(compressed_residual).reshape(shape)
+      x_hat = x_hat + residual_hat
     
-    fail_idx = np.frombuffer(header["fail_idx"], dtype=np.int32)
-    fail_val = np.frombuffer(header["fail_val"], dtype=np.float32)
-    data_hat.flat[fail_idx] = fail_val
-  
-    return data_hat
+    x_hat[fail_mask] = fail_val
+    if has_nan:
+      x_hat[nan_mask] = np.nan
+
+    return x_hat
 
 class ErrorBoundedCompressionPipelineFullGPU(ErrorBoundedCompressionPipeline):
   def _compress(

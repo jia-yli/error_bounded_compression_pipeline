@@ -5,6 +5,9 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ErrorBoundedCompressionPipeline"
 version = "0.1"
+dependencies = [
+  "zarr == 2.18.2"
+]
 
 [tool.setuptools.packages.find]
 include = ["error_bounded_compression_pipeline"]

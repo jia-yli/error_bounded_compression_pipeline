@@ -47,22 +47,22 @@ def run_compression_pipeline(
   error_bound = interpolated_ensemble_spread * ebcc_pointwise_max_error_ratio
 
   # Run
-  steps = 24*7
+  steps = 31
   data = data[0:steps]
   error_bound = error_bound[0:steps]
-  if np.isnan(data).any():
-    return {
-      'variable': variable,
-      'year': year,
-      'month': month,
-      # 'ebcc_pointwise_max_error_ratio' : np.nan, 
-      # 'compression_ratio' : np.nan,
-      # 'compression_time' : np.nan,
-      # 'compression_bandwidth': np.nan,
-      # 'decompression_bandwidth': np.nan,
-    }
+  # if np.isnan(data).any():
+  #   return {
+  #     'variable': variable,
+  #     'year': year,
+  #     'month': month,
+  #     # 'ebcc_pointwise_max_error_ratio' : np.nan, 
+  #     # 'compression_ratio' : np.nan,
+  #     # 'compression_time' : np.nan,
+  #     # 'compression_bandwidth': np.nan,
+  #     # 'decompression_bandwidth': np.nan,
+  #   }
 
-  compression_pipeline = ErrorBoundedCompressionPipelineFullGPU(
+  compression_pipeline = ErrorBoundedCompressionPipeline(
     checkpoint_path1, 
     checkpoint_path2,
     device=f'cuda:{worker_idx}')
@@ -92,6 +92,12 @@ def run_compression_pipeline(
   decompression_bandwidth = data_size_bytes/1e6/decompression_time
 
   # import pdb;pdb.set_trace()
+  # check
+  # import pdb;pdb.set_trace()
+  nan_match = (np.isnan(data) == np.isnan(data_hat)).all()
+  exclude_mask = np.isnan(data) | np.isnan(error_bound)
+  data_match = (np.abs(data - data_hat) <= error_bound)[~exclude_mask].all()
+  assert nan_match and data_match, f"{variable} {year}-{month} data mismatch: {nan_match=}, {data_match=}"
 
   results = {
     'variable': variable,
@@ -112,23 +118,23 @@ def run_compression_pipeline(
 
 if __name__ == '__main__':
   variable_lst = [
-    "100m_u_component_of_wind",
-    "100m_v_component_of_wind",
-    "10m_u_component_of_wind",
-    "10m_v_component_of_wind",
-    "2m_dewpoint_temperature",
-    "2m_temperature",
-    "ice_temperature_layer_1",
-    "ice_temperature_layer_2",
-    "ice_temperature_layer_3",
-    "ice_temperature_layer_4",
-    "maximum_2m_temperature_since_previous_post_processing",
-    "mean_sea_level_pressure",
-    "minimum_2m_temperature_since_previous_post_processing",
+    # "100m_u_component_of_wind",
+    # "100m_v_component_of_wind",
+    # "10m_u_component_of_wind",
+    # "10m_v_component_of_wind",
+    # "2m_dewpoint_temperature",
+    # "2m_temperature",
+    # "ice_temperature_layer_1",
+    # "ice_temperature_layer_2",
+    # "ice_temperature_layer_3",
+    # "ice_temperature_layer_4",
+    # "maximum_2m_temperature_since_previous_post_processing",
+    # "mean_sea_level_pressure",
+    # "minimum_2m_temperature_since_previous_post_processing",
     "sea_surface_temperature",
-    "skin_temperature",
-    "surface_pressure",
-    "total_precipitation",
+    # "skin_temperature",
+    # "surface_pressure",
+    # "total_precipitation",
   ]
   year_lst = [2024]
   month_lst = [12]
@@ -150,7 +156,7 @@ if __name__ == '__main__':
   ))
 
   num_gpus = torch.cuda.device_count()
-  # num_gpus = 1
+  num_gpus = 1
   ctx = mp.get_context('spawn')
   pool = ctx.Pool(processes=num_gpus)
   results = []
