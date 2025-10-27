@@ -41,6 +41,6 @@ srun --environment=/users/ljiayong/projects/LIC_TCM/docker/alps/clariden.toml ba
   cd error_bounded_compression_pipeline
   pip install fire
   pip install -e .
-  python ./scripts/test.py 50
+  python ./scripts/gen_aurora.py 4.5
   date --utc
 "
